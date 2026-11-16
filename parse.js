@@ -657,25 +657,36 @@ function findClosingBracket(text, openIdx) {
       continue;
     }
     if (c === 96) {
+      // a backtick run pairs with the NEXT backtick run of any length
+      // (a code span in the label — the `]`s between are span content,
+      // not the label close). With no later run at all, a run of 2+
+      // directly before `]` is still consumed; anything else cannot be
+      // part of a label, so there is no closing bracket.
       let j = i;
       while (j < n && text.charCodeAt(j) === 96) j++;
       const ticks = j - i;
       let k = j;
       let close = -1;
+      let closeEnd = -1;
       while (k < n) {
         if (text.charCodeAt(k) === 96) {
           let m = k;
           while (m < n && text.charCodeAt(m) === 96) m++;
-          if (m - k === ticks) {
-            close = k;
-            break;
-          }
-          k = m;
-        } else k++;
+          close = k;
+          closeEnd = m;
+          break;
+        }
+        k++;
       }
-      if (close === -1) return -1;
-      i = close + ticks;
-      continue;
+      if (close !== -1) {
+        i = closeEnd;
+        continue;
+      }
+      if (ticks >= 2 && j < n && text.charCodeAt(j) === 93) {
+        i = j;
+        continue;
+      }
+      return -1;
     }
     if (c === 91) depth++;
     else if (c === 93) {
@@ -2005,7 +2016,10 @@ function looksLikeRefDef(line) {
 
 // Does this line start a block that interrupts a paragraph? `nextLine` is
 // the following line (for the table check) or null.
-function isInterruptingBlockStart(line, nextLine) {
+// inItem: true while parsing the content of a list item (reset by a
+// blockquote). Inside a list item ANY ordered marker interrupts a
+// paragraph; elsewhere only an ordered marker starting with 1 does.
+function isInterruptingBlockStart(line, nextLine, inItem) {
   if (parseAtx(line)) return true;
   if (parseFenceStart(line)) return true;
   if (isHrLine(line)) return true;
@@ -2016,7 +2030,7 @@ function isInterruptingBlockStart(line, nextLine) {
   const m = parseMarker(line);
   if (m && !m.empty) {
     if (m.kind === 'bullet') return true;
-    if (m.num === 1) return true;
+    if (m.num === 1 || inItem) return true;
   }
   if (
     nextLine !== null &&
@@ -2073,8 +2087,16 @@ function classifyLine(line, nextLine) {
 // Returns {open, lineCount, lastLen, nested}: lineCount is the number of
 // lines in the open paragraph, lastLen the length of its last line (sentinel
 // stripped), nested whether the paragraph sits inside a nested list or
-// blockquote.
-function paragraphInfo(lines) {
+// blockquote. The scan tracks fenced code blocks across blank lines: while
+// a fence is open no paragraph is open, so a lazy line can never be
+// absorbed into a fence, and fence content lines are never treated as
+// paragraph text (an indented-code 4-strip must not eat them).
+function paragraphInfo(lines, inItem) {
+  // The paragraph (if any) starts after the last blank line. A fence can
+  // span blank lines, so first determine whether a fence is open at that
+  // point with a cheap forward scan that tracks fences only (no block
+  // classification — that is the O(n^2) cost a full scan would pay on
+  // every continuation line).
   let start = 0;
   for (let k = lines.length - 1; k >= 0; k--) {
     if (blankLine(lines[k])) {
@@ -2083,31 +2105,71 @@ function paragraphInfo(lines) {
     }
     if (k === 0) start = 0;
   }
+  let fenceChar = 0;
+  let fenceLen = 0;
+  for (let k = 0; k < start; k++) {
+    const line = lines[k];
+    if (fenceChar) {
+      if (isFenceClose(line, fenceChar, fenceLen)) {
+        fenceChar = 0;
+        fenceLen = 0;
+      }
+    } else {
+      const fs = parseFenceStart(line);
+      if (fs) {
+        fenceChar = fs.fenceChar;
+        fenceLen = fs.len;
+      }
+    }
+  }
   const suffix = lines.slice(start);
   if (suffix.length === 0) {
     return { open: false, lineCount: 0, lastLen: 0, nested: false };
   }
-  let state = 'block';
+  let state = fenceChar ? 'fence' : 'block'; // 'block' | 'para' | 'fence'
   let paraStart = -1;
   let paraNested = false;
+  let lastLine = '';
   for (let k = 0; k < suffix.length; k++) {
     const line = suffix[k];
     const next = k + 1 < suffix.length ? suffix[k + 1] : null;
+    if (state === 'fence') {
+      if (isFenceClose(line, fenceChar, fenceLen)) {
+        state = 'block';
+        fenceChar = 0;
+        fenceLen = 0;
+      }
+      lastLine = line;
+      continue;
+    }
     if (state === 'para') {
       if (isSetextLine(line)) {
         state = 'block';
         paraStart = -1;
         paraNested = false;
+        lastLine = line;
         continue;
       }
-      if (isInterruptingBlockStart(line, next)) {
+      if (isInterruptingBlockStart(line, next, inItem)) {
         state = 'block';
         paraStart = -1;
         paraNested = false;
         // fall through: re-classify this line from 'block'
       } else {
+        lastLine = line;
         continue;
       }
+    }
+    // state === 'block'
+    const fs = parseFenceStart(line);
+    if (fs) {
+      state = 'fence';
+      fenceChar = fs.fenceChar;
+      fenceLen = fs.len;
+      paraStart = -1;
+      paraNested = false;
+      lastLine = line;
+      continue;
     }
     const c = classifyLine(line, next);
     if (c === 'para') {
@@ -2123,15 +2185,16 @@ function paragraphInfo(lines) {
       paraStart = -1;
       paraNested = false;
     }
+    lastLine = line;
   }
   if (state !== 'para') {
     return { open: false, lineCount: 0, lastLen: 0, nested: false };
   }
-  const lastLine = stripSentinel(suffix[suffix.length - 1]);
+  const last = stripSentinel(lastLine);
   return {
     open: true,
     lineCount: suffix.length - paraStart,
-    lastLen: lastLine.length,
+    lastLen: last.length,
     nested: paraNested,
   };
 }
@@ -2140,7 +2203,7 @@ function paragraphInfo(lines) {
 // (Table headers, ref defs and indented-looking lines ARE lazy text;
 // ATX, fences, HRs, HTML blocks 1-6, blockquotes and interrupting list
 // markers are not.)
-function isLazyLine(line, nextLine) {
+function isLazyLine(line, nextLine, inItem) {
   if (blankLine(line)) return false;
   if (parseAtx(line)) return false;
   if (parseFenceStart(line)) return false;
@@ -2152,7 +2215,7 @@ function isLazyLine(line, nextLine) {
   const m = parseMarker(line);
   if (m && !m.empty) {
     if (m.kind === 'bullet') return false;
-    if (m.num === 1) return false;
+    if (m.num === 1 || inItem) return false;
   }
   return true;
 }
@@ -2342,8 +2405,8 @@ function parseBlockquote(lines, i, end, refs) {
       continue;
     }
     // no marker: lazy continuation?
-    const info = paragraphInfo(content);
-    if (info.open && isLazyLine(line, j + 1 < end ? lines[j + 1] : null)) {
+    const info = paragraphInfo(content, false);
+    if (info.open && isLazyLine(line, j + 1 < end ? lines[j + 1] : null, false)) {
       if (isSetextLine(line)) {
         if (info.nested) {
           content.push(line);
@@ -2354,10 +2417,17 @@ function parseBlockquote(lines, i, end, refs) {
         }
       } else {
         // a lazy line with 4+ columns of leading whitespace loses 4
-        // columns; it is paragraph text only, never a new block
+        // columns — but only when the open paragraph is the quote's OWN
+        // paragraph. When the paragraph is nested (inside a sub-item or
+        // quote), the line belongs to that nested block: push it
+        // untouched so the nested parser strips its own indent.
         const lind = indentOf(line);
         if (lind.col >= 4) {
-          content.push(LAZY + stripIndentCols(line, 4));
+          if (info.nested) {
+            content.push(line);
+          } else {
+            content.push(LAZY + stripIndentCols(line, 4));
+          }
         } else {
           content.push(LAZY + line);
         }
@@ -2368,7 +2438,7 @@ function parseBlockquote(lines, i, end, refs) {
     }
     break;
   }
-  const inner = parseBlocks(content, 0, content.length, refs);
+  const inner = parseBlocks(content, 0, content.length, refs, false);
   return { node: { t: 'blockquote', children: inner.nodes }, next: j };
 }
 
@@ -2422,12 +2492,22 @@ function parseListItem(lines, j, end, refs, first, m) {
       pending = [];
       // outdent the continuation line; a line indented 4+ columns past
       // the content indent is paragraph text when a paragraph is open
-      // (indented code cannot interrupt a paragraph)
+      // (indented code cannot interrupt a paragraph) — but only when the
+      // open paragraph is this item's OWN paragraph. When the paragraph
+      // is nested (inside a sub-item or quote), the line belongs to that
+      // nested block: push it untouched so the nested parser strips its
+      // own indent (a nested list marker must stay a marker, and a
+      // nested paragraph keeps its remaining columns).
       const stripped = expandAndStrip(line, contentIndent);
       let sp = 0;
       while (sp < stripped.length && stripped.charCodeAt(sp) === 32) sp++;
-      if (sp >= 4 && paragraphInfo(contentLines).open) {
-        contentLines.push(LAZY + stripped.slice(4));
+      if (sp >= 4) {
+        const info = paragraphInfo(contentLines, true);
+        if (info.open && !info.nested) {
+          contentLines.push(LAZY + stripped.slice(4));
+        } else {
+          contentLines.push(stripped);
+        }
       } else {
         contentLines.push(stripped);
       }
@@ -2443,8 +2523,8 @@ function parseListItem(lines, j, end, refs, first, m) {
     }
     // lazy continuation?
     if (pending.length === 0) {
-      const info = paragraphInfo(contentLines);
-      if (info.open && isLazyLine(line, k + 1 < end ? lines[k + 1] : null)) {
+      const info = paragraphInfo(contentLines, true);
+      if (info.open && isLazyLine(line, k + 1 < end ? lines[k + 1] : null, true)) {
         if (isSetextLine(line)) {
           if (info.nested) {
             contentLines.push(line);
@@ -2475,7 +2555,7 @@ function parseListItem(lines, j, end, refs, first, m) {
     const last = contentLines[contentLines.length - 1];
     contentLines[contentLines.length - 1] = last.replace(/[ \t]+$/, '');
   }
-  const inner = parseBlocks(contentLines, 0, contentLines.length, refs);
+  const inner = parseBlocks(contentLines, 0, contentLines.length, refs, true);
   return {
     item: { nodes: inner.nodes },
     loose: inner.loose,
@@ -2552,7 +2632,7 @@ function parseList(lines, i, end, refs) {
 // Parse the blocks in lines[start..end). Returns {nodes, next, loose} where
 // loose is true when a blank line falls between two consumed things (a block
 // or a link reference definition) at this level.
-function parseBlocks(lines, start, end, refs) {
+function parseBlocks(lines, start, end, refs, inItem) {
   const nodes = [];
   let i = start;
   let loose = false;
@@ -2607,7 +2687,7 @@ function parseBlocks(lines, start, end, refs) {
     ) {
       r = parseTable(lines, i, end);
     } else {
-      r = parseParagraph(lines, i, end, refs);
+      r = parseParagraph(lines, i, end, refs, inItem);
     }
     nodes.push(r.node);
     seenThing = true;
@@ -2618,7 +2698,7 @@ function parseBlocks(lines, start, end, refs) {
 }
 
 // Parse a paragraph (or setext heading) starting at lines[i].
-function parseParagraph(lines, i, end, refs) {
+function parseParagraph(lines, i, end, refs, inItem) {
   const paraLines = [];
   let j = i;
   while (j < end) {
@@ -2635,7 +2715,7 @@ function parseParagraph(lines, i, end, refs) {
     }
     if (paraLines.length > 0) {
       const next = j + 1 < end ? lines[j + 1] : null;
-      if (isInterruptingBlockStart(line, next)) break;
+      if (isInterruptingBlockStart(line, next, inItem)) break;
     }
     paraLines.push(line);
     j++;
